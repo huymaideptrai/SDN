@@ -1,44 +1,83 @@
 import asyncio
-from app.services.ryu_client import RyuSDNClient
+import logging
+from collections import defaultdict
+from app.core.config import settings
+from app.services.ryu_client import RyuSDNClient, RyuError, ryu_client
+from app.services import sdn_rules
+from app.services.state_lock import switch_state_lock
 from app.models.database import SessionLocal
-from app.models.models import FlowPolicy
+from app.models.models import FlowPolicy, QoSProfile
 
-# Khởi tạo client kết nối Ryu
-ryu = RyuSDNClient(ryu_url="http://192.168.179.130:8080")
+# Dùng logger của uvicorn để log hiện cùng log server. Không dùng print: khi stdout bị
+# chuyển hướng ra file trên Windows (cp1252), print tiếng Việt ném UnicodeEncodeError
+# và làm chết vòng lặp sync; logging tự xử lý lỗi ghi log thay vì ném exception.
+logger = logging.getLogger("uvicorn.error")
 
-network_cache = {
-    "topology": {},
-    "port_stats": {}
-}
 
-async def poll_ryu_stats():
-    """Nhiệm vụ 1: Lấy Topology và Port Stats mỗi 2 giây lưu vào RAM"""
-    while True:
-        try:
-            topo_data = await ryu.get_topology()
-            if topo_data.get("status") == "success":
-                network_cache["topology"] = topo_data
-        except Exception as e:
-            print(f"[Cache Worker] Lỗi kết nối Ryu: {e}")
-            
-        await asyncio.sleep(2)
+async def sync_switch(ryu: RyuSDNClient, dpid: int, policies, profiles) -> int:
+    """Cài lại các luật/meter có trong DB nhưng đang thiếu trên switch. Trả về số mục đã cài bù."""
+    installed = 0
+    cookies = {f.get("cookie") for f in await ryu.get_flows(dpid)}
+
+    if profiles:
+        meters = {m.get("meter_id") for m in await ryu.get_meters(dpid)}
+        for profile in profiles:
+            meter = sdn_rules.qos_meter(profile)
+            if meter["meter_id"] not in meters:
+                await ryu.add_meter(meter)
+                installed += 1
+            flow = sdn_rules.qos_flow(profile)
+            if flow["cookie"] not in cookies:
+                await ryu.add_flow(flow)
+                installed += 1
+
+    # Chỉ cài bù flow còn thiếu: cài lại flow đang tồn tại sẽ reset bộ đếm packet/byte
+    for policy in policies:
+        flow = sdn_rules.policy_flow(policy)
+        if flow["cookie"] not in cookies:
+            await ryu.add_flow(flow)
+            installed += 1
+    return installed
+
+
+async def sync_once(ryu: RyuSDNClient = ryu_client) -> int:
+    # Không chạy xen kẽ với endpoint đang thêm/xoá luật (tránh cài lại thứ vừa bị xoá)
+    async with switch_state_lock():
+        return await _sync_once(ryu)
+
+
+async def _sync_once(ryu: RyuSDNClient) -> int:
+    db = SessionLocal()
+    try:
+        policies = defaultdict(list)
+        for p in db.query(FlowPolicy).filter(FlowPolicy.is_active == True).all():
+            policies[int(p.dpid)].append(p)
+        profiles = defaultdict(list)
+        for q in db.query(QoSProfile).all():
+            profiles[int(q.dpid)].append(q)
+
+        total = 0
+        for dpid in await ryu.get_switches():
+            if policies[dpid] or profiles[dpid]:
+                total += await sync_switch(ryu, dpid, policies[dpid], profiles[dpid])
+        return total
+    finally:
+        db.close()
+
 
 async def sync_flow_state():
-    """Nhiệm vụ 2: Đồng bộ luật từ DB xuống Ryu mỗi 30 giây"""
+    """Đồng bộ luật từ DB xuống switch theo chu kỳ (khôi phục sau khi Ryu/switch khởi động lại).
+    Vòng lặp không được dừng vì bất kỳ lỗi nào, chỉ dừng khi bị cancel lúc tắt server."""
     while True:
-        db = SessionLocal()
         try:
-            active_flows = db.query(FlowPolicy).filter(FlowPolicy.is_active == True).all()
-            for flow in active_flows:
-                await ryu.add_flow(
-                    dpid=int(flow.dpid),
-                    match=flow.match_conditions,
-                    actions=flow.action,
-                    priority=flow.priority
-                )
-        except Exception as e:
-            print(f"[Sync Worker] Lỗi đồng bộ DB: {e}")
-        finally:
-            db.close()
-            
-        await asyncio.sleep(30)
+            installed = await sync_once()
+            if installed:
+                logger.info("[Sync Worker] Đã cài bù %d luật/meter xuống switch", installed)
+        except asyncio.CancelledError:
+            raise
+        except RyuError as e:
+            logger.warning("[Sync Worker] %s", e.message)
+        except Exception:
+            logger.exception("[Sync Worker] Lỗi đồng bộ")
+
+        await asyncio.sleep(settings.SYNC_INTERVAL_SECONDS)

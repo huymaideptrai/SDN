@@ -1,0 +1,3 @@
+# File chạy trên VM Linux phải dùng LF (bash không chạy được script CRLF)
+sdn_network/** text eol=lf
+*.sh text eol=lf
